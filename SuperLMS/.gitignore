@@ -1,0 +1,6 @@
+.env
+*.log
+__pycache__/
+*.pyc
+processed_ids.json
+.claude/

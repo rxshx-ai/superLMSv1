@@ -1,0 +1,11 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+python-dotenv>=1.0.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# AWS Bedrock (Claude) — primary LLM provider
+anthropic[bedrock]>=0.40.0
+
+# Groq (Llama) — optional fallback, safe to remove if not needed
+groq>=0.9.0
