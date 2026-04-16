@@ -3,4 +3,5 @@
 __pycache__/
 *.pyc
 processed_ids.json
+LOG.txt
 .claude/
