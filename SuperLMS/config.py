@@ -16,7 +16,7 @@ MOODLE_PASSWORD = os.getenv("MOODLE_PASSWORD")
 
 # ── LLM Provider ─────────────────────────────────────────────────────
 # Set to "bedrock" to use AWS Bedrock (Claude), or "groq" for Groq (Llama)
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "bedrock")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq")
 
 # ── AWS Bedrock Settings ─────────────────────────────────────────────
 # Region where Bedrock is available
