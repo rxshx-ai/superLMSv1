@@ -9,6 +9,7 @@ Usage:
     python agent.py
 """
 
+import re
 import json
 import time
 import signal
@@ -35,25 +36,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agent")
 
-# ── State Persistence ─────────────────────────────────────────────────
+# ── State Persistence (per user) ──────────────────────────────────────
 
-STATE_FILE = Path(__file__).parent / "processed_ids.json"
+def _state_file(name: str) -> Path:
+    """Return the processed-ids state file for a given user.
+
+    Each user gets an isolated state file so one user's processed prompts
+    never suppress another's.
+    """
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name) or "default"
+    return Path(__file__).parent / f"processed_ids_{safe}.json"
 
 
-def load_processed_ids() -> set:
-    """Load the set of already-processed blog entry IDs from disk."""
-    if STATE_FILE.exists():
+def load_processed_ids(name: str) -> set:
+    """Load the set of already-processed blog entry IDs for *name*."""
+    state_file = _state_file(name)
+    if state_file.exists():
         try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            data = json.loads(state_file.read_text(encoding="utf-8"))
             return set(data)
         except (json.JSONDecodeError, TypeError):
             return set()
     return set()
 
 
-def save_processed_ids(ids: set):
-    """Persist the set of processed IDs."""
-    STATE_FILE.write_text(
+def save_processed_ids(name: str, ids: set):
+    """Persist the set of processed IDs for *name*."""
+    _state_file(name).write_text(
         json.dumps(sorted(ids), indent=2), encoding="utf-8"
     )
 
@@ -74,16 +83,26 @@ class LLMBridgeAgent:
          d. Mark the prompt as processed
     """
 
-    def __init__(self):
-        config.validate()
+    def __init__(
+        self,
+        name: str,
+        moodle_url: str,
+        username: str,
+        password: str,
+        llm: LLMClient | None = None,
+    ):
+        self.name = name
+        self.log = logging.getLogger(f"agent[{name}]")
 
         self.moodle = MoodleClient(
-            base_url=config.MOODLE_URL,
-            username=config.MOODLE_USERNAME,
-            password=config.MOODLE_PASSWORD,
+            base_url=moodle_url,
+            username=username,
+            password=password,
         )
-        self.llm = LLMClient()
-        self.processed_ids = load_processed_ids()
+        # The LLM client is safe to share across users/threads; build one
+        # per agent only if the caller didn't supply a shared instance.
+        self.llm = llm or LLMClient()
+        self.processed_ids = load_processed_ids(name)
         self._running = True
 
     # ── Prompt / Response Identification ──────────────────────────────
@@ -154,11 +173,11 @@ class LLMBridgeAgent:
         try:
             entries = self.moodle.get_blog_entries()
         except Exception as e:
-            logger.error("Failed to fetch blog entries: %s", e)
+            self.log.error("Failed to fetch blog entries: %s", e)
             return
 
         if not entries:
-            logger.debug("No blog entries found.")
+            self.log.debug("No blog entries found.")
             return
 
         already_answered = self.get_response_entry_ids(entries)
@@ -171,10 +190,10 @@ class LLMBridgeAgent:
         ]
 
         if not new_prompts:
-            logger.debug("No new prompts to process.")
+            self.log.debug("No new prompts to process.")
             return
 
-        logger.info("Found %d new prompt(s) to process.", len(new_prompts))
+        self.log.info("Found %d new prompt(s) to process.", len(new_prompts))
 
         for prompt_entry in new_prompts:
             self._process_prompt(prompt_entry)
@@ -183,7 +202,7 @@ class LLMBridgeAgent:
         """Process a single prompt: get LLM response and post it back."""
         prompt_id   = self._entry_id(prompt_entry)
         prompt_text = self.extract_prompt_text(prompt_entry)
-        logger.info(
+        self.log.info(
             "Processing blog entry #%d: %.80s...",
             prompt_id,
             prompt_text,
@@ -193,7 +212,7 @@ class LLMBridgeAgent:
         try:
             response_text = self.llm.generate_response(prompt_text)
         except Exception as e:
-            logger.error("LLM failed for entry #%d: %s", prompt_id, e)
+            self.log.error("LLM failed for entry #%d: %s", prompt_id, e)
             response_text = f"[Agent Error: Could not get LLM response - {e}]"
 
         # 2. Build the response blog entry
@@ -217,16 +236,16 @@ class LLMBridgeAgent:
             )
             if success:
                 self.processed_ids.add(prompt_id)
-                save_processed_ids(self.processed_ids)
-                logger.info(
+                save_processed_ids(self.name, self.processed_ids)
+                self.log.info(
                     "Posted response blog entry for prompt #%d", prompt_id
                 )
             else:
-                logger.error(
+                self.log.error(
                     "Failed to post response for prompt #%d", prompt_id
                 )
         except Exception as e:
-            logger.error(
+            self.log.error(
                 "Error posting response for entry #%d: %s", prompt_id, e
             )
 
@@ -253,11 +272,16 @@ class LLMBridgeAgent:
     # ── Main Loop ─────────────────────────────────────────────────────
 
     def run(self):
-        """Start the continuous polling loop."""
-        logger.info("=" * 60)
-        logger.info("Moodle LLM Bridge Agent - Starting")
-        logger.info("=" * 60)
+        """Start the continuous polling loop for this user.
 
+        A login failure stops *this* user's loop only — it never exits the
+        process, so other users' agents keep running.
+        """
+        self.log.info("Agent starting for user '%s'", self.name)
+
+        # Signal handlers can only be registered from the main thread.
+        # When many agents run in worker threads, the parent process wires
+        # up shutdown instead (see run_all / the FastAPI service).
         if threading.current_thread() is threading.main_thread():
             signal.signal(signal.SIGINT, self._shutdown)
             signal.signal(signal.SIGTERM, self._shutdown)
@@ -265,12 +289,12 @@ class LLMBridgeAgent:
         try:
             self.moodle.login()
         except Exception as e:
-            logger.critical("Could not log in to Moodle: %s", e)
-            sys.exit(1)
+            self.log.critical("Could not log in to Moodle: %s — agent stopped.", e)
+            self._running = False
+            return
 
-        logger.info(
-            "Polling every %ds for [LLMQ] blog entries",
-            config.POLL_INTERVAL,
+        self.log.info(
+            "Polling every %ds for [LLMQ] blog entries", config.POLL_INTERVAL
         )
 
         while self._running:
@@ -278,16 +302,69 @@ class LLMBridgeAgent:
             if self._running:
                 time.sleep(config.POLL_INTERVAL)
 
-        logger.info("Agent stopped.")
+        self.log.info("Agent stopped for user '%s'.", self.name)
 
     def _shutdown(self, signum, frame):
         """Handle graceful shutdown."""
-        logger.info("Received signal %s - shutting down", signum)
+        self.log.info("Received signal %s - shutting down", signum)
         self._running = False
+
+
+# ── Multi-user Runner ─────────────────────────────────────────────────
+
+def build_agents(users: list[dict], llm: LLMClient | None = None) -> list["LLMBridgeAgent"]:
+    """Create one agent per user, all sharing a single LLM client."""
+    shared_llm = llm or LLMClient()
+    return [
+        LLMBridgeAgent(
+            name=u["name"],
+            moodle_url=config.MOODLE_URL,
+            username=u["username"],
+            password=u["password"],
+            llm=shared_llm,
+        )
+        for u in users
+    ]
+
+
+def start_agents(agents: list["LLMBridgeAgent"]) -> list[threading.Thread]:
+    """Start each agent's poll loop in its own daemon thread."""
+    threads: list[threading.Thread] = []
+    for agent in agents:
+        agent._running = True
+        t = threading.Thread(target=agent.run, name=f"agent-{agent.name}", daemon=True)
+        t.start()
+        threads.append(t)
+    return threads
+
+
+def run_all() -> None:
+    """Validate config, then run one poll loop per configured user."""
+    users = config.validate()
+    agents = build_agents(users)
+    threads = start_agents(agents)
+
+    logger.info("Started %d user agent(s).", len(agents))
+
+    def _shutdown(signum, frame):
+        logger.info("Received signal %s - stopping all agents", signum)
+        for a in agents:
+            a._running = False
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    try:
+        while any(t.is_alive() for t in threads):
+            time.sleep(1)
+    except KeyboardInterrupt:
+        for a in agents:
+            a._running = False
+
+    logger.info("All agents stopped.")
 
 
 # ── Entry Point ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    agent = LLMBridgeAgent()
-    agent.run()
+    run_all()

@@ -1,7 +1,7 @@
-"""FastAPI service wrapper for the Moodle LLM Bridge agent.
+"""FastAPI service wrapper for the multi-user Moodle LLM Bridge.
 
 This application:
-- Starts the existing LLMBridgeAgent in a background thread
+- Starts one background LLMBridgeAgent per configured user (users.json)
 - Exposes simple HTTP endpoints for health checks and basic control
 
 Run locally:
@@ -17,6 +17,7 @@ from typing import Optional
 
 from fastapi import FastAPI
 
+import agent as agent_module
 from agent import LLMBridgeAgent
 import config
 
@@ -27,57 +28,51 @@ logging.basicConfig(
 )
 
 
-_agent: Optional[LLMBridgeAgent] = None
-_agent_thread: Optional[threading.Thread] = None
+_agents: list[LLMBridgeAgent] = []
+_threads: list[threading.Thread] = []
 
 
-def start_agent_if_needed() -> None:
-    """Ensure the background Moodle agent is running."""
-    global _agent, _agent_thread
+def start_agents_if_needed() -> None:
+    """Ensure a background agent is running for every configured user."""
+    global _agents, _threads
 
-    if _agent is None:
-        logger.info("Initialising LLMBridgeAgent for FastAPI service …")
-        _agent = LLMBridgeAgent()
+    if not _agents:
+        logger.info("Initialising user agents for FastAPI service …")
+        users = config.validate()
+        _agents = agent_module.build_agents(users)
 
-    if _agent_thread is None or not _agent_thread.is_alive():
-        logger.info("Starting LLMBridgeAgent background thread …")
-        _agent._running = True  # reuse the agent's run-loop flag
-        _agent_thread = threading.Thread(
-            target=_agent.run,
-            name="llm-bridge-agent",
-            daemon=True,
-        )
-        _agent_thread.start()
+    # (Re)start any agents whose thread isn't alive.
+    alive = {t.name for t in _threads if t.is_alive()}
+    to_start = [a for a in _agents if f"agent-{a.name}" not in alive]
+    if to_start:
+        logger.info("Starting %d agent thread(s) …", len(to_start))
+        _threads.extend(agent_module.start_agents(to_start))
 
 
-def stop_agent() -> None:
-    """Request the background agent loop to stop."""
-    global _agent
-    if _agent is not None:
-        logger.info("Stopping LLMBridgeAgent background thread …")
-        _agent._running = False
+def stop_agents() -> None:
+    """Request every background agent loop to stop."""
+    for a in _agents:
+        a._running = False
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[override]
-    """FastAPI lifespan context to manage the background agent."""
-    # On startup
-    start_agent_if_needed()
+    """FastAPI lifespan context to manage the background agents."""
+    start_agents_if_needed()
     try:
         yield
     finally:
-        # On shutdown
-        stop_agent()
+        stop_agents()
 
 
 app = FastAPI(
     title="Moodle LLM Bridge API",
     description=(
-        "HTTP wrapper around the Moodle LLM Bridge agent. "
-        "The agent polls Moodle dashboard text blocks for [LLMQ] prompts "
-        "and posts [LLMR#<id>] responses using an LLM backend."
+        "HTTP wrapper around the multi-user Moodle LLM Bridge. "
+        "One agent per user polls Moodle for [LLMQ] prompts and posts "
+        "[LLMR#<id>] responses using an LLM backend."
     ),
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -88,41 +83,48 @@ async def health() -> dict:
     return {
         "status": "ok",
         "moodle_url": config.MOODLE_URL,
-        "llm_provider": "GROQ",
+        "llm_provider": config.LLM_PROVIDER.upper(),
+        "users": len(_agents),
         "poll_interval": config.POLL_INTERVAL,
     }
 
 
 @app.get("/status", tags=["agent"])
 async def status() -> dict:
-    global _agent, _agent_thread
-
-    processed_count = len(_agent.processed_ids) if _agent else 0
-    running = bool(_agent_thread and _agent_thread.is_alive())
-
+    """Per-user agent status."""
+    alive = {t.name for t in _threads if t.is_alive()}
+    users = [
+        {
+            "name": a.name,
+            "running": f"agent-{a.name}" in alive,
+            "processed_prompts": len(a.processed_ids),
+        }
+        for a in _agents
+    ]
     return {
-        "agent_running": running,
-        "processed_prompts": processed_count,
+        "agents_running": sum(1 for u in users if u["running"]),
+        "total_users": len(_agents),
         "poll_interval": config.POLL_INTERVAL,
+        "users": users,
     }
 
 
 @app.post("/control/poll-once", tags=["agent"])
 async def poll_once() -> dict:
-
-    global _agent
-    if _agent is None:
-        start_agent_if_needed()
-
-    assert _agent is not None
-    _agent.poll_once()
-
-    return {"status": "ok"}
+    """Run a single poll cycle for every user (useful for testing)."""
+    if not _agents:
+        start_agents_if_needed()
+    for a in _agents:
+        a.poll_once()
+    return {"status": "ok", "users_polled": len(_agents)}
 
 
 @app.post("/control/restart", tags=["agent"])
-async def restart_agent() -> dict:
-    """Restart the background agent thread."""
-    stop_agent()
-    start_agent_if_needed()
-    return {"status": "restarted"}
+async def restart_agents() -> dict:
+    """Restart all background agent threads."""
+    global _agents, _threads
+    stop_agents()
+    _agents = []
+    _threads = []
+    start_agents_if_needed()
+    return {"status": "restarted", "users": len(_agents)}

@@ -1,7 +1,11 @@
 .env
+users.json
 *.log
 __pycache__/
 *.pyc
+.venv/
+.pytest_cache/
 processed_ids.json
+processed_ids_*.json
 LOG.txt
 .claude/

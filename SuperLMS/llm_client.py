@@ -1,4 +1,4 @@
-"""LLM client — AWS Bedrock (Claude) with Groq fallback."""
+"""LLM client — AWS Bedrock (via the model-agnostic Converse API) with Groq fallback."""
 
 from __future__ import annotations
 
@@ -22,7 +22,8 @@ class LLMClient:
     """Provider-agnostic LLM wrapper.
 
     Reads LLM_PROVIDER from config:
-        - "bedrock"  → AWS Bedrock (Claude via IAM role or access keys)
+        - "bedrock"  → AWS Bedrock via the Converse API (any model:
+                       Moonshot Kimi, Anthropic Claude, …), IAM role or keys
         - "groq"     → Groq API (Llama models, fallback)
 
     Usage:
@@ -52,9 +53,13 @@ class LLMClient:
 # ── Bedrock Backend ───────────────────────────────────────────────────
 
 class _BedrockClient:
-    """Calls Claude on AWS Bedrock using the Anthropic SDK.
+    """Calls a Bedrock model through the provider-agnostic Converse API.
 
-    Auth (in priority order):
+    Converse works uniformly across Bedrock models (Moonshot Kimi,
+    Anthropic Claude, Meta Llama, …), so switching models is just a
+    config change — no code change.
+
+    Auth (in priority order, handled by boto3's default credential chain):
         1. IAM Role attached to EC2 instance (recommended — no keys needed)
         2. AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY in .env
         3. ~/.aws/credentials on the machine
@@ -62,39 +67,38 @@ class _BedrockClient:
 
     def __init__(self, model_name: Optional[str] = None):
         try:
-            from anthropic import AnthropicBedrock
+            import boto3
         except ImportError:
             raise ImportError(
-                "anthropic[bedrock] is not installed. "
-                "Run: pip install 'anthropic[bedrock]'"
+                "boto3 is not installed. Run: pip install boto3"
             )
 
         self._model = model_name or config.BEDROCK_MODEL
 
         # If access keys are set in .env, pass them explicitly.
-        # If running on EC2 with an IAM role, leave them as None —
-        # the SDK picks them up automatically from instance metadata.
-        kwargs: dict = {"aws_region": config.AWS_REGION}
+        # If running on EC2 with an IAM role, leave them unset —
+        # boto3 picks them up automatically from instance metadata.
+        kwargs: dict = {"region_name": config.AWS_REGION}
         if config.AWS_ACCESS_KEY_ID and config.AWS_SECRET_ACCESS_KEY:
-            kwargs["aws_access_key"] = config.AWS_ACCESS_KEY_ID
-            kwargs["aws_secret_key"] = config.AWS_SECRET_ACCESS_KEY
+            kwargs["aws_access_key_id"] = config.AWS_ACCESS_KEY_ID
+            kwargs["aws_secret_access_key"] = config.AWS_SECRET_ACCESS_KEY
             logger.info("Bedrock auth: using explicit access keys from .env")
         else:
             logger.info("Bedrock auth: using IAM role / default credential chain")
 
-        self._client = AnthropicBedrock(**kwargs)
+        self._client = boto3.client("bedrock-runtime", **kwargs)
         logger.info("Bedrock client ready | model=%s | region=%s",
                     self._model, config.AWS_REGION)
 
     def generate(self, prompt: str) -> str:
         try:
-            message = self._client.messages.create(
-                model=self._model,
-                max_tokens=4096,
-                system=_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt}],
+            response = self._client.converse(
+                modelId=self._model,
+                system=[{"text": _SYSTEM_PROMPT}],
+                messages=[{"role": "user", "content": [{"text": prompt}]}],
+                inferenceConfig={"maxTokens": 4096, "temperature": 0.7},
             )
-            text = message.content[0].text or ""
+            text = response["output"]["message"]["content"][0]["text"] or ""
             if text:
                 logger.info(
                     "Got response (%d chars) [bedrock/%s] for prompt: %.60s…",
